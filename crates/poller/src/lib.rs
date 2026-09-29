@@ -581,8 +581,10 @@ async fn poll_contract(
     loop {
         // Issue #23: use join=operations to fetch operations inline, eliminating
         // one HTTP request per transaction.
+        // Issue #2: `include_failed=true` is required or Horizon only returns
+        // successful transactions, which makes `TransactionFailed` dead.
         let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations",
+            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations&include_failed=true",
             poll_base, contract.contract_id, page_cursor
         );
 
