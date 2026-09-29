@@ -51,8 +51,29 @@ struct HorizonOperation {
     op_type: String,
     /// Present on `invoke_host_function` operations.
     function: Option<String>,
-    /// Present on `payment` operations (string, e.g. "1000.0000000").
+    /// Present on `payment` operations (string, e.g. "1000.0000000"). On path
+    /// payments this is the amount the destination receives.
     amount: Option<String>,
+    /// Present on `create_account` operations: the native starting balance.
+    starting_balance: Option<String>,
+    /// Present on path payment operations: the amount the source sends.
+    source_amount: Option<String>,
+    /// Asset of `amount` on path payments (`"native"` for XLM).
+    asset_type: Option<String>,
+    /// Asset of `source_amount` on path payments (`"native"` for XLM).
+    source_asset_type: Option<String>,
+    /// Present on `invoke_host_function` operations: Stellar Asset Contract
+    /// balance changes caused by the call.
+    asset_balance_changes: Option<Vec<AssetBalanceChange>>,
+}
+
+/// One entry of `asset_balance_changes` on an `invoke_host_function` operation.
+#[derive(Deserialize)]
+struct AssetBalanceChange {
+    #[serde(rename = "type")]
+    change_type: String,
+    amount: Option<String>,
+    asset_type: Option<String>,
 }
 
 /// A Horizon transaction record that may include inline operations via `join=operations`.
@@ -124,6 +145,9 @@ struct RpcEvent {
 /// single contract.
 const RPC_EVENTS_PAGE_LIMIT: usize = 1000;
 
+/// Horizon returns at most this many transactions per page (`limit=200`).
+const HORIZON_PAGE_LIMIT: usize = 200;
+
 // ── Summary counters ──────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -131,8 +155,22 @@ struct Counters {
     contracts: AtomicU64,
     transactions: AtomicU64,
     alerts: AtomicU64,
+    skipped: AtomicU64,
     interval_transactions: AtomicU64,
     interval_alerts: AtomicU64,
+    interval_skipped: AtomicU64,
+}
+
+impl Counters {
+    /// Adds the outcome of one poll of one contract to the running totals.
+    fn record_poll(&self, txs: u64, alerts: u64, skipped: u64) {
+        self.transactions.fetch_add(txs, Ordering::Relaxed);
+        self.alerts.fetch_add(alerts, Ordering::Relaxed);
+        self.skipped.fetch_add(skipped, Ordering::Relaxed);
+        self.interval_transactions.fetch_add(txs, Ordering::Relaxed);
+        self.interval_alerts.fetch_add(alerts, Ordering::Relaxed);
+        self.interval_skipped.fetch_add(skipped, Ordering::Relaxed);
+    }
 }
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -145,7 +183,7 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
 /// Run the polling loop forever. Each contract is polled concurrently via a
 /// tokio JoinSet; one slow or failing contract never blocks the others.
 /// Logs a summary every 60 seconds: contracts watched, transactions processed,
-/// alerts fired.
+/// transactions skipped, alerts fired.
 pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
     // No shutdown signal: hold the sender so the receiver never fires.
     let (_tx, rx) = watch::channel(false);
@@ -169,24 +207,11 @@ pub async fn run_with_shutdown(
 /// keep their cursors; new contracts start from the start-cursor rules
 /// (`cursor_file` entry, else `now`). HTTP client settings are not reloaded.
 pub async fn run_with_reload(
-    cfg: AppConfig,
+    mut cfg: AppConfig,
     dry_run: bool,
     mut shutdown: watch::Receiver<bool>,
-    _reload: mpsc::Receiver<AppConfig>,
+    mut reload: mpsc::Receiver<AppConfig>,
 ) -> Result<()> {
-    // 0 disables keepalive, as documented on `AppConfig::http_tcp_keepalive_secs`.
-    let keepalive =
-        (cfg.http_tcp_keepalive_secs > 0).then(|| Duration::from_secs(cfg.http_tcp_keepalive_secs));
-
-    let client = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .pool_max_idle_per_host(cfg.http_pool_max_idle_per_host)
-        .tcp_keepalive(keepalive)
-        .build()
-        .context("failed to build HTTP client")?;
-
-    let mut cursors = start_cursors(&cfg);
-    let cursors = load_cursors(&cfg);
     let client = build_poll_client(&cfg)?;
     let mut cursors = load_cursors(&cfg);
 
@@ -259,12 +284,15 @@ pub async fn run_with_reload(
                     tokio::time::sleep(summary_every).await;
                     let interval_txs = c.interval_transactions.swap(0, Ordering::Relaxed);
                     let interval_alerts = c.interval_alerts.swap(0, Ordering::Relaxed);
+                    let interval_skipped = c.interval_skipped.swap(0, Ordering::Relaxed);
                     info!(
                         contracts = c.contracts.load(Ordering::Relaxed),
                         transactions_total = c.transactions.load(Ordering::Relaxed),
                         alerts_total = c.alerts.load(Ordering::Relaxed),
+                        skipped_total = c.skipped.load(Ordering::Relaxed),
                         transactions_interval = interval_txs,
                         alerts_interval = interval_alerts,
+                        skipped_interval = interval_skipped,
                         "60-second summary"
                     );
                 }
@@ -275,124 +303,22 @@ pub async fn run_with_reload(
         }
     });
 
-    // Each contract runs on its own task and interval, so a slow contract or a
-    // short per-contract interval never affects the schedule of the others.
-    let mut tasks = JoinSet::new();
-    for contract in cfg.contracts {
-        if !contract.enabled {
-            info!(contract = %contract.label, "contract is disabled — skipping");
-            continue;
-        }
-        let interval =
-            Duration::from_secs(contract.effective_poll_interval(cfg.poll_interval_seconds));
-        let mut contract_cursors: HashMap<String, String> = cursors
-            .get_key_value(&contract.contract_id)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .into_iter()
-            .collect();
-        let client = client.clone();
-        let counters = Arc::clone(&counters);
-        let mut shutdown = shutdown.clone();
-        // Cooldown state lives as long as this contract's task.
-        let mut cooldowns = CooldownTracker::new();
-
-        tasks.spawn(async move {
-            let mut poll_state = ContractPollState::default();
-            loop {
-                match poll_contract(&client, &contract, &mut contract_cursors, &mut poll_state, dry_run).await {
-                match poll_contract(
-                    &client,
-                    &contract,
-                    &mut contract_cursors,
-                    &mut cooldowns,
-                    dry_run,
-                )
-                .await
-                {
-                    Ok((txs, alerts, _webhook_failures)) => {
-                        counters.transactions.fetch_add(txs, Ordering::Relaxed);
-                        counters.alerts.fetch_add(alerts, Ordering::Relaxed);
-                        counters
-                            .interval_transactions
-                            .fetch_add(txs, Ordering::Relaxed);
-                        counters
-                            .interval_alerts
-                            .fetch_add(alerts, Ordering::Relaxed);
-                        // Issue #25: increment Prometheus counters when metrics feature is enabled.
-                        #[cfg(feature = "metrics")]
-                        {
-                            let network = contract.network.as_str();
-                            metrics::inc_transactions(&contract.label, network, txs);
-                            metrics::inc_alerts(&contract.label, network, alerts);
-                            metrics::record_poll_success(&contract.label, network);
-                            metrics::mark_poll_success();
-                        }
-                    }
-                    Err(e) => {
-                        error!(contract = %contract.label, error = %e, "contract polling task failed");
-                        #[cfg(feature = "metrics")]
-                        metrics::record_poll_failure(&contract.label, contract.network.as_str());
-                    }
-                }
-
-                if *shutdown.borrow() {
-                    }
-                    Err(e) => {
-                        error!(contract = %contract.label, error = %e, "contract polling task failed");
-                        #[cfg(feature = "metrics")]
-                        metrics::record_poll_failure(&contract.label, contract.network.as_str());
-                    }
-                }
-
-                if *shutdown.borrow() {
-                    break;
-                }
-                tokio::select! {
-                    () = tokio::time::sleep(interval) => {}
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    while let Some(result) = tasks.join_next().await {
-        if let Err(e) = result {
-            error!(error = ?e, "contract polling task panicked");
     loop {
         // Each contract runs on its own task and interval, so a slow contract or
         // a short per-contract interval never affects the schedule of the others.
         // `stop` ends this generation of tasks on shutdown or reload.
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut tasks = JoinSet::new();
+        let max_pages = cfg.effective_max_pages_per_cycle();
         for contract in &cfg.contracts {
-            match poll_contract(&client, contract, &mut cursors, &mut cooldowns, dry_run).await {
-                Ok((txs, alerts, _webhook_failures)) => {
-                    counters.transactions.fetch_add(txs, Ordering::Relaxed);
-                    counters.alerts.fetch_add(alerts, Ordering::Relaxed);
-                    counters
-                        .interval_transactions
-                        .fetch_add(txs, Ordering::Relaxed);
-                    counters
-                        .interval_alerts
-                        .fetch_add(alerts, Ordering::Relaxed);
-                    // Issue #25: increment Prometheus counters when metrics feature is enabled.
-                    #[cfg(feature = "metrics")]
-                    {
-                        let network = contract.network.as_str();
-                        metrics::inc_transactions(&contract.label, network, txs);
-                        metrics::inc_alerts(&contract.label, network, alerts);
-                        metrics::record_poll_success(&contract.label, network);
-                        metrics::mark_poll_success();
-                    }
-                    Err(e) => error!(contract = %contract.label, error = %e, "contract polling task failed"),
+            if !contract.enabled {
+                info!(contract = %contract.label, "contract is disabled — skipping");
+                continue;
+            }
             let interval =
                 Duration::from_secs(contract.effective_poll_interval(cfg.poll_interval_seconds));
             let cursor = cursors
-                .get(&contract.contract_id)
+                .get(&contract.cursor_key())
                 .cloned()
                 .unwrap_or_else(|| "now".to_string());
             tasks.spawn(poll_contract_forever(
@@ -400,6 +326,7 @@ pub async fn run_with_reload(
                 contract.clone(),
                 cursor,
                 interval,
+                max_pages,
                 dry_run,
                 Arc::clone(&counters),
                 stop_rx.clone(),
@@ -415,8 +342,8 @@ pub async fn run_with_reload(
         let _ = stop_tx.send(true);
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok((contract_id, cursor)) => {
-                    cursors.insert(contract_id, cursor);
+                Ok((key, cursor)) => {
+                    cursors.insert(key, cursor);
                 }
                 Err(e) => error!(error = ?e, "contract polling task panicked"),
             }
@@ -428,13 +355,13 @@ pub async fn run_with_reload(
             .contracts
             .iter()
             .map(|c| {
-                let id = c.contract_id.clone();
+                let key = c.cursor_key();
                 let cursor = cursors
-                    .get(&id)
-                    .or_else(|| start.get(&id))
+                    .get(&key)
+                    .or_else(|| start.get(&key))
                     .cloned()
                     .unwrap_or_else(|| "now".to_string());
-                (id, cursor)
+                (key, cursor)
             })
             .collect();
         counters
@@ -465,34 +392,45 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 }
 
 /// Polls one contract every `interval` until `stop` reports `true`, finishing
-/// the in-flight poll first. Returns the contract ID and its latest cursor.
+/// the in-flight poll first. Returns the contract's cursor key and its latest
+/// cursor.
+#[allow(clippy::too_many_arguments)]
 async fn poll_contract_forever(
     client: Client,
     contract: WatchedContract,
     cursor: String,
     interval: Duration,
+    max_pages: usize,
     dry_run: bool,
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
 ) -> (String, String) {
-    let mut cursors = HashMap::from([(contract.contract_id.clone(), cursor)]);
+    let key = contract.cursor_key();
+    let mut cursors = HashMap::from([(key.clone(), cursor)]);
+    // Poll state and cooldowns live as long as this contract's task.
+    let mut state = ContractPollState::default();
+    let mut cooldowns = CooldownTracker::new();
     loop {
-        match poll_contract(&client, &contract, &mut cursors, dry_run).await {
-            Ok((txs, alerts, _webhook_failures)) => {
-                counters.transactions.fetch_add(txs, Ordering::Relaxed);
-                counters.alerts.fetch_add(alerts, Ordering::Relaxed);
-                counters
-                    .interval_transactions
-                    .fetch_add(txs, Ordering::Relaxed);
-                counters
-                    .interval_alerts
-                    .fetch_add(alerts, Ordering::Relaxed);
+        match poll_contract(
+            &client,
+            &contract,
+            &mut cursors,
+            &mut state,
+            &mut cooldowns,
+            max_pages,
+            dry_run,
+        )
+        .await
+        {
+            Ok((txs, alerts, _webhook_failures, skipped)) => {
+                counters.record_poll(txs, alerts, skipped);
                 // Issue #25: increment Prometheus counters when metrics feature is enabled.
                 #[cfg(feature = "metrics")]
                 {
                     let network = contract.network.as_str();
                     metrics::inc_transactions(&contract.label, network, txs);
                     metrics::inc_alerts(&contract.label, network, alerts);
+                    metrics::inc_transactions_skipped(&contract.label, network, skipped);
                     metrics::record_poll_success(&contract.label, network);
                     metrics::mark_poll_success();
                 }
@@ -514,167 +452,98 @@ async fn poll_contract_forever(
                     break;
                 }
             }
-        });
-    }
-
-    // Wait for a reload signal or shutdown; on reload, restart all tasks.
-    loop {
-        tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    break;
-                }
-            }
-            Some(new_cfg) = reload.recv() => {
-                let start = start_cursors(&new_cfg);
-                // Merge existing cursors with new ones.
-                cursors = new_cfg
-                    .contracts
-                    .iter()
-                    .map(|c| {
-                        let id = c.contract_id.clone();
-                        let cursor = cursors
-                            .get(&id)
-                            .or_else(|| start.get(&id))
-                            .cloned()
-                            .unwrap_or_else(|| "now".to_string());
-                        (id, cursor)
-                    })
-                    .collect();
-                counters
-                    .contracts
-                    .store(new_cfg.contracts.len() as u64, Ordering::Relaxed);
-                info!(
-                    contracts = new_cfg.contracts.len(),
-                    interval_secs = new_cfg.poll_interval_seconds,
-                    "configuration reloaded"
-                );
-                cfg = new_cfg;
-                // Abort all existing tasks and restart with new config.
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-
-                for contract in &cfg.contracts {
-                    if !contract.enabled {
-                        info!(contract = %contract.label, "contract is disabled — skipping");
-                        continue;
-                    }
-                    let interval = Duration::from_secs(
-                        contract.effective_poll_interval(cfg.poll_interval_seconds),
-                    );
-                    let mut contract_cursors: HashMap<String, String> = cursors
-                        .get_key_value(&contract.contract_id)
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .into_iter()
-                        .collect();
-                    let client = client.clone();
-                    let counters = Arc::clone(&counters);
-                    let contract = contract.clone();
-                    let mut shutdown = shutdown.clone();
-
-                    tasks.spawn(async move {
-                        loop {
-                            match poll_contract(&client, &contract, &mut contract_cursors, dry_run)
-                                .await
-                            {
-                                Ok((txs, alerts, _)) => {
-                                    counters.transactions.fetch_add(txs, Ordering::Relaxed);
-                                    counters.alerts.fetch_add(alerts, Ordering::Relaxed);
-                                    counters
-                                        .interval_transactions
-                                        .fetch_add(txs, Ordering::Relaxed);
-                                    counters
-                                        .interval_alerts
-                                        .fetch_add(alerts, Ordering::Relaxed);
-                                    #[cfg(feature = "metrics")]
-                                    {
-                                        let network = contract.network.as_str();
-                                        metrics::inc_transactions(&contract.label, network, txs);
-                                        metrics::inc_alerts(&contract.label, network, alerts);
-                                        metrics::record_poll_success(&contract.label, network);
-                                        metrics::mark_poll_success();
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(
-                                        contract = %contract.label, error = %e,
-                                        "contract polling task failed"
-                                    );
-                                    #[cfg(feature = "metrics")]
-                                    metrics::record_poll_failure(
-                                        &contract.label,
-                                        contract.network.as_str(),
-                                    );
-                                }
-                            }
-
-                            if *shutdown.borrow() {
-                                break;
-                            }
-
-                            tokio::select! {
-                                () = tokio::time::sleep(interval) => {}
-                                _ = shutdown.changed() => {
-                                    if *shutdown.borrow() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-            }
         }
     }
 
-    // Signal all tasks to stop, then wait for them.
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
-
-    info!("TxWatch polling engine stopped cleanly");
-    Ok(())
+    let cursor = cursors.remove(&key).unwrap_or_else(|| "now".to_string());
+    (key, cursor)
 }
 
-/// Initial cursor per contract: the `cursor_file` entry when present, else `now`.
-fn start_cursors(cfg: &AppConfig) -> HashMap<String, String> {
+/// Reads the raw cursor map from `path`. An unreadable or unparseable file is
+/// logged and treated as empty, so every contract starts from `now`.
+fn read_saved_cursors(path: &str) -> HashMap<String, String> {
+    match fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
+            Ok(map) => map,
+            Err(e) => {
+                warn!(error = ?e, "failed to parse cursor_file; starting from 'now' for all contracts");
+                HashMap::new()
+            }
+        },
+        Err(e) => {
+            debug!(error = ?e, "could not read cursor_file; starting from 'now'");
+            HashMap::new()
         }
     }
-
-    let cursor = cursors
-        .remove(&contract.contract_id)
-        .unwrap_or_else(|| "now".to_string());
-    (contract.contract_id, cursor)
 }
 
-/// Load the cursor map from `cfg.cursor_file`, defaulting every configured
-/// contract without a saved cursor to Horizon's `now`. An unreadable or
-/// unparseable file is logged and every contract starts from `now`.
-fn load_cursors(cfg: &AppConfig) -> HashMap<String, String> {
-    let mut cursors: HashMap<String, String> = HashMap::new();
-    if let Some(path) = &cfg.cursor_file {
-        match fs::read_to_string(path) {
-            Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
-                Ok(map) => cursors = map,
-                Err(e) => {
-                    warn!(error = ?e, "failed to parse cursor_file; starting from 'now' for all contracts")
-                }
-            },
-            Err(e) => debug!(error = ?e, "could not read cursor_file; starting from 'now'"),
+/// Resolves the saved cursor map against the configured contracts.
+///
+/// `configured` holds one `(cursor_key, contract_id)` pair per configured
+/// contract. Cursors are keyed `<network>:<contract_id>`; files written before
+/// that format existed key them by the bare contract ID. A legacy entry is
+/// migrated to the new key only when exactly one configured contract has that
+/// ID — with several (the same contract on more than one network) there is no
+/// way to know which network the cursor belongs to, so those contracts start
+/// from `now` rather than risk sending one network's paging token to another.
+/// Entries in the new format for contracts that are not configured are kept
+/// so they survive a save; unmigrated legacy entries are dropped.
+fn migrate_saved_cursors(
+    saved: HashMap<String, String>,
+    configured: &[(String, String)],
+) -> HashMap<String, String> {
+    let mut cursors: HashMap<String, String> = saved
+        .iter()
+        .filter(|(key, _)| key.contains(':'))
+        .map(|(key, cursor)| (key.clone(), cursor.clone()))
+        .collect();
+
+    for (key, contract_id) in configured {
+        if cursors.contains_key(key) {
+            continue;
         }
-    }
-    // Ensure every configured contract has a cursor entry.
-    for c in &cfg.contracts {
-        cursors
-            .entry(c.contract_id.clone())
-            .or_insert_with(|| "now".to_string());
+        let Some(legacy) = saved.get(contract_id) else {
+            continue;
+        };
+        let owners = configured
+            .iter()
+            .filter(|(_, id)| id == contract_id)
+            .count();
+        if owners == 1 {
+            info!(contract_id = %contract_id, "migrating legacy cursor to the per-network key");
+            cursors.insert(key.clone(), legacy.clone());
+        } else {
+            warn!(
+                contract_id = %contract_id,
+                "cursor_file has a legacy cursor for a contract watched on several networks; \
+                 starting those contracts from 'now'"
+            );
+        }
     }
     cursors
 }
 
-/// Load the cursor map from `cfg.cursor_file`, defaulting every configured
-/// contract without a saved cursor to Horizon's `now`.
+/// Load the cursor map, keyed `<network>:<contract_id>` (see
+/// [`WatchedContract::cursor_key`]), from `cfg.cursor_file`, migrating legacy
+/// contract-ID keys and defaulting every configured contract without a saved
+/// cursor to Horizon's `now`.
 fn load_cursors(cfg: &AppConfig) -> HashMap<String, String> {
-    start_cursors(cfg)
+    let saved = cfg
+        .cursor_file
+        .as_deref()
+        .map(read_saved_cursors)
+        .unwrap_or_default();
+    let configured: Vec<(String, String)> = cfg
+        .contracts
+        .iter()
+        .map(|c| (c.cursor_key(), c.contract_id.clone()))
+        .collect();
+    let mut cursors = migrate_saved_cursors(saved, &configured);
+    // Ensure every configured contract has a cursor entry.
+    for (key, _) in configured {
+        cursors.entry(key).or_insert_with(|| "now".to_string());
+    }
+    cursors
 }
 
 /// Write the cursor map to `cfg.cursor_file`, if one is configured. Writes to a
@@ -726,6 +595,7 @@ impl CycleReport {
 pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
     let client = build_poll_client(&cfg)?;
     let mut cursors = load_cursors(&cfg);
+    let max_pages = cfg.effective_max_pages_per_cycle();
     let mut report = CycleReport::default();
     // A single cycle: cooldowns only dedupe within this run.
     let mut cooldowns = CooldownTracker::new();
@@ -735,11 +605,19 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
             info!(contract = %contract.label, "contract is disabled — skipping");
             continue;
         }
-        match poll_contract(&client, contract, &mut cursors, dry_run).await {
         let mut state = ContractPollState::default();
-        match poll_contract(&client, contract, &mut cursors, &mut state, dry_run).await {
-        match poll_contract(&client, contract, &mut cursors, &mut cooldowns, dry_run).await {
-            Ok((txs, alerts, webhook_failures)) => {
+        match poll_contract(
+            &client,
+            contract,
+            &mut cursors,
+            &mut state,
+            &mut cooldowns,
+            max_pages,
+            dry_run,
+        )
+        .await
+        {
+            Ok((txs, alerts, webhook_failures, _skipped)) => {
                 report.transactions += txs;
                 report.alerts += alerts;
                 report.webhook_failures += webhook_failures;
@@ -770,14 +648,17 @@ pub struct ContractPollState {
     pub suppressor: WarningSuppressor,
 }
 
-/// Returns `(transactions_processed, alerts_fired, webhook_failures)`.
+/// Returns `(transactions_processed, alerts_fired, webhook_failures, transactions_skipped)`.
 ///
 /// Uses `join=operations` on the transactions endpoint so that Horizon returns
 /// operations inline, eliminating one HTTP request per transaction (#23).
 /// Falls back to a separate `/transactions/{hash}/operations` fetch only when
 /// the inline `operations` array is absent (older Horizon versions).
-#[tracing::instrument(skip(client, contract, cursors, state), fields(
-#[tracing::instrument(skip(client, contract, cursors, cooldowns), fields(
+///
+/// Pages are processed as they arrive rather than buffered, and at most
+/// `max_pages` pages (200 transactions each) are fetched per call. When the cap
+/// is hit a warning is logged and the next call resumes from the saved cursor.
+#[tracing::instrument(skip(client, contract, cursors, state, cooldowns), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
     network     = %contract.network.as_str()
@@ -788,10 +669,12 @@ async fn poll_contract(
     cursors: &mut HashMap<String, String>,
     state: &mut ContractPollState,
     cooldowns: &mut CooldownTracker,
+    max_pages: usize,
     dry_run: bool,
-) -> Result<(u64, u64, u64)> {
+) -> Result<(u64, u64, u64, u64)> {
+    let cursor_key = contract.cursor_key();
     let cursor = cursors
-        .get(&contract.contract_id)
+        .get(&cursor_key)
         .cloned()
         .unwrap_or_else(|| "now".to_string());
 
@@ -804,78 +687,10 @@ async fn poll_contract(
         .unwrap_or_else(|| contract.network.horizon_base_url());
     let canonical_base = contract.network.horizon_base_url();
 
-    // Collect all pages of transactions.
-    let mut all_records: Vec<HorizonTransactionWithOps> = Vec::new();
-    let mut page_cursor = cursor.clone();
-
-    loop {
-        // Issue #23: use join=operations to fetch operations inline, eliminating
-        // one HTTP request per transaction.
-        let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations",
-            poll_base, contract.contract_id, page_cursor
-        );
-
-        #[cfg(feature = "metrics")]
-        let started = std::time::Instant::now();
-        let response = client.get(&url).send().await;
-        #[cfg(feature = "metrics")]
-        metrics::observe_horizon_request(
-            contract.network.as_str(),
-            started.elapsed().as_secs_f64(),
-        );
-        let response = response.with_context(|| format!("GET {} failed", url))?;
-
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("Retry-After")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5);
-            warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
-            tokio::time::sleep(Duration::from_secs(retry_after)).await;
-            return Ok((0, 0, 0));
-        }
-
-        let status = response.status();
-        let page: HorizonPage = response
-            .error_for_status()
-            .with_context(|| format!("Horizon returned HTTP {} for {}", status, url))?
-            .json()
-            .await
-            .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
-        let records = page._embedded.records;
-        if records.is_empty() {
-            break;
-        }
-
-        let last_token = records.last().map(|r| r.tx.paging_token.clone());
-        let count = records.len();
-        for r in records {
-            all_records.push(r);
-        }
-
-        if count < 200 {
-            break;
-        }
-        if let Some(token) = last_token {
-            page_cursor = token;
-        } else {
-            break;
-        }
-    }
-
-    if !all_records.is_empty() {
-        info!(contract = %contract.label, count = all_records.len(), "fetched new transactions");
-    } else {
-        debug!(contract = %contract.label, cursor = %cursor, "no new transactions");
-    }
-
     let mut tx_count = 0u64;
     let mut alert_count = 0u64;
     let mut webhook_failures = 0u64;
+    let mut skipped = 0u64;
     // Contract events per ledger, fetched at most once per cycle and only
     // when the contract has an EventEmitted rule.
     let mut events_by_ledger: HashMap<u32, Vec<RpcEvent>> = HashMap::new();
@@ -894,93 +709,153 @@ async fn poll_contract(
         explorer_base: contract.network.explorer_base_url(),
     };
 
-    for record in all_records {
-        let paging_token = record.tx.paging_token.clone();
-        let tx_hash = record.tx.hash.clone();
-
-        // Advance cursor before enrichment so the tx is not re-processed even if
-        // op enrichment fails.
-        cursors.insert(contract.contract_id.clone(), paging_token.clone());
-
-        // Issue #23: if Horizon returned inline operations, use them directly.
-        // Otherwise fall back to a separate /operations fetch.
-        let (function_names, amount_stroops) = if !record.operations.is_empty() {
-            debug!(contract = %contract.label, tx = %tx_hash, "using inline operations (join=operations)");
-            extract_soroban_details(record.operations)
-        } else {
-            match fetch_soroban_details(client, poll_base, &tx_hash).await {
-                Ok(details) => details,
-                Err(e) => {
-                    warn!(
-                        contract = %contract.label, tx = %tx_hash, error = %e,
-                        "could not fetch operation details — evaluating rules without them"
-                    );
-                    (Vec::new(), None)
-                }
-            }
-        };
-
-        let ledger = record.tx.ledger;
-        let enriched = match EnrichedTransaction::from_horizon(
-            record.tx,
-            function_names,
-            amount_stroops,
-            None,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(contract = %contract.label, tx = %tx_hash, error = %e,
-                    "skipping transaction due to enrichment error");
-                continue;
-            }
-        };
-
-        // Track the most recent transaction timestamp for NoActivity evaluation.
-        state.last_seen = Some(
-            state
-                .last_seen
-                .map(|prev| prev.max(enriched.timestamp))
-                .unwrap_or(enriched.timestamp),
-        );
-
-        tx_count += 1;
-
-        let payloads = evaluate(
-            &eval_ctx,
-            &contract.rules,
-            &enriched,
-            Some(&state.suppressor),
-        );
-        let enriched = if contract.needs_events() {
-            let events = transaction_events(
-                client,
-                contract,
-                &tx_hash,
-                ledger,
-                &mut events_by_ledger,
-            )
-            .await;
-            enriched.with_events(events)
-        } else {
-            enriched
-        };
-
-        tx_count += 1;
-
-        let payloads = evaluate_contract(contract, canonical_base, &enriched);
-
-        if payloads.is_empty() {
-            debug!(contract = %contract.label, tx = %tx_hash,
-                "transaction evaluated but no rules matched");
+    let mut page_cursor = cursor.clone();
+    let mut pages_fetched = 0usize;
+    loop {
+        if pages_fetched >= max_pages {
+            warn!(
+                contract = %contract.label,
+                max_pages_per_cycle = max_pages,
+                "reached max_pages_per_cycle; more transactions may be pending — continuing \
+                 from the saved cursor next cycle"
+            );
+            break;
         }
-        let payloads = cooldowns.apply(&contract.rules, payloads, chrono::Utc::now());
 
-        for payload in payloads {
-            alert_count += 1;
-            deliver_payload(
-                client, contract, &payload, dry_run, &mut webhook_failures,
-            )
-            .await;
+        // Issue #23: use join=operations to fetch operations inline, eliminating
+        // one HTTP request per transaction.
+        let url = format!(
+            "{}/accounts/{}/transactions?cursor={}&order=asc&limit={}&join=operations",
+            poll_base, contract.contract_id, page_cursor, HORIZON_PAGE_LIMIT
+        );
+        let records = match fetch_transactions_page(client, contract, &url).await {
+            Ok(PageFetch::Records(records)) => records,
+            Ok(PageFetch::RateLimited { retry_after }) => {
+                warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
+                tokio::time::sleep(Duration::from_secs(retry_after)).await;
+                break;
+            }
+            // Nothing processed yet: surface the error and leave the cursor alone.
+            Err(e) if pages_fetched == 0 => return Err(e),
+            // Earlier pages were already processed and the cursor advanced past
+            // them; stop here so their batched alerts and deliveries still finish.
+            Err(e) => {
+                error!(contract = %contract.label, error = %e,
+                    "failed to fetch a later page — continuing from the saved cursor next cycle");
+                break;
+            }
+        };
+        pages_fetched += 1;
+
+        if records.is_empty() {
+            if pages_fetched == 1 {
+                debug!(contract = %contract.label, cursor = %cursor, "no new transactions");
+            }
+            break;
+        }
+        let page_len = records.len();
+        let last_token = records.last().map(|r| r.tx.paging_token.clone());
+        info!(contract = %contract.label, count = page_len, "fetched new transactions");
+
+        for record in records {
+            let paging_token = record.tx.paging_token.clone();
+            let tx_hash = record.tx.hash.clone();
+
+            // Advance cursor before enrichment so the tx is not re-processed even if
+            // op enrichment fails.
+            cursors.insert(cursor_key.clone(), paging_token.clone());
+
+            // Issue #23: if Horizon returned inline operations, use them directly.
+            // Otherwise fall back to a separate /operations fetch.
+            let (function_names, amount_stroops) = if !record.operations.is_empty() {
+                debug!(contract = %contract.label, tx = %tx_hash, "using inline operations (join=operations)");
+                extract_soroban_details(record.operations)
+            } else {
+                match fetch_soroban_details(client, poll_base, &tx_hash).await {
+                    Ok(details) => details,
+                    Err(e) => {
+                        warn!(
+                            contract = %contract.label, tx = %tx_hash, error = %e,
+                            "could not fetch operation details — evaluating rules without them"
+                        );
+                        (Vec::new(), None)
+                    }
+                }
+            };
+
+            let ledger = record.tx.ledger;
+            let enriched = match EnrichedTransaction::from_horizon(
+                record.tx,
+                function_names,
+                amount_stroops,
+                None,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(contract = %contract.label, tx = %tx_hash, error = %e,
+                        "skipping transaction due to enrichment error");
+                    // The cursor already advanced past this transaction, so count
+                    // the skip or it would be invisible in summaries and metrics.
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            // Track the most recent transaction timestamp for NoActivity evaluation.
+            state.last_seen = Some(
+                state
+                    .last_seen
+                    .map(|prev| prev.max(enriched.timestamp))
+                    .unwrap_or(enriched.timestamp),
+            );
+
+            tx_count += 1;
+
+            let payloads = evaluate(
+                &eval_ctx,
+                &contract.rules,
+                &enriched,
+                Some(&state.suppressor),
+            );
+            let enriched = if contract.needs_events() {
+                let events = transaction_events(
+                    client,
+                    contract,
+                    &tx_hash,
+                    ledger,
+                    &mut events_by_ledger,
+                )
+                .await;
+                enriched.with_events(events)
+            } else {
+                enriched
+            };
+
+            tx_count += 1;
+
+            let payloads = evaluate_contract(contract, canonical_base, &enriched);
+
+            if payloads.is_empty() {
+                debug!(contract = %contract.label, tx = %tx_hash,
+                    "transaction evaluated but no rules matched");
+            }
+            let payloads = cooldowns.apply(&contract.rules, payloads, chrono::Utc::now());
+
+            for payload in payloads {
+                alert_count += 1;
+                deliver_payload(
+                    client, contract, &payload, dry_run, &mut webhook_failures,
+                )
+                .await;
+            }
+        }
+
+        if page_len < HORIZON_PAGE_LIMIT {
+            break;
+        }
+        match last_token {
+            Some(token) => page_cursor = token,
+            None => break,
         }
     }
 
@@ -1129,7 +1004,49 @@ async fn poll_contract(
             "poll cycle complete");
     }
 
-    Ok((tx_count, alert_count, webhook_failures))
+    Ok((tx_count, alert_count, webhook_failures, skipped))
+}
+
+/// One page of a Horizon transactions request.
+enum PageFetch {
+    Records(Vec<HorizonTransactionWithOps>),
+    /// Horizon answered 429; wait `retry_after` seconds before polling again.
+    RateLimited { retry_after: u64 },
+}
+
+/// Fetches and parses one page of transactions from `url`.
+async fn fetch_transactions_page(
+    client: &Client,
+    contract: &WatchedContract,
+    url: &str,
+) -> Result<PageFetch> {
+    #[cfg(feature = "metrics")]
+    let started = std::time::Instant::now();
+    let response = client.get(url).send().await;
+    #[cfg(feature = "metrics")]
+    metrics::observe_horizon_request(contract.network.as_str(), started.elapsed().as_secs_f64());
+    #[cfg(not(feature = "metrics"))]
+    let _ = contract;
+    let response = response.with_context(|| format!("GET {} failed", url))?;
+
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = response
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5);
+        return Ok(PageFetch::RateLimited { retry_after });
+    }
+
+    let status = response.status();
+    let page: HorizonPage = response
+        .error_for_status()
+        .with_context(|| format!("Horizon returned HTTP {} for {}", status, url))?
+        .json()
+        .await
+        .with_context(|| format!("failed to parse Horizon response from {}", url))?;
+    Ok(PageFetch::Records(page._embedded.records))
 }
 
 /// Deliver a single `AlertPayload` to the contract's webhook, counting any
@@ -1294,14 +1211,85 @@ fn evaluate_contract(
 
 // ── Soroban operation enrichment ──────────────────────────────────────────────
 
+/// Parses a Horizon decimal amount such as `"12.5000000"` into stroops
+/// (1 XLM = 10^7 stroops) exactly, without going through floating point.
+/// Returns `None` for anything that is not a non-negative decimal with at most
+/// seven fractional digits.
+fn parse_stroops(amount: &str) -> Option<u64> {
+    let amount = amount.trim();
+    let (whole, frac) = amount.split_once('.').unwrap_or((amount, ""));
+    if whole.is_empty() && frac.is_empty() {
+        return None;
+    }
+    if !whole.chars().all(|c| c.is_ascii_digit())
+        || !frac.chars().all(|c| c.is_ascii_digit())
+        || frac.len() > 7
+    {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let frac: u64 = format!("{:0<7}", frac).parse().ok()?;
+    whole.checked_mul(10_000_000)?.checked_add(frac)
+}
+
+fn is_native(asset_type: &Option<String>) -> bool {
+    asset_type.as_deref() == Some("native")
+}
+
+/// Native XLM moved by one operation, in stroops, for the operation types that
+/// move value besides `payment`:
+///
+/// - `create_account`: the `starting_balance`;
+/// - `path_payment_strict_send` / `path_payment_strict_receive`: the native
+///   leg — `amount` when the destination asset is native, otherwise
+///   `source_amount` when the source asset is native (a path payment from XLM
+///   into another asset). A native-to-native path payment counts once;
+/// - `invoke_host_function`: every native `transfer` in `asset_balance_changes`
+///   (Stellar Asset Contract transfers).
+fn native_stroops_moved(op: &HorizonOperation) -> Option<u64> {
+    match op.op_type.as_str() {
+        "create_account" => op.starting_balance.as_deref().and_then(parse_stroops),
+        "path_payment_strict_send" | "path_payment_strict_receive" => {
+            if is_native(&op.asset_type) {
+                op.amount.as_deref().and_then(parse_stroops)
+            } else if is_native(&op.source_asset_type) {
+                op.source_amount.as_deref().and_then(parse_stroops)
+            } else {
+                None
+            }
+        }
+        "invoke_host_function" => {
+            let mut total: Option<u64> = None;
+            for change in op.asset_balance_changes.iter().flatten() {
+                if change.change_type != "transfer" || !is_native(&change.asset_type) {
+                    continue;
+                }
+                if let Some(stroops) = change.amount.as_deref().and_then(parse_stroops) {
+                    total = Some(total.unwrap_or(0).saturating_add(stroops));
+                }
+            }
+            total
+        }
+        _ => None,
+    }
+}
+
 /// Extract Soroban details from a slice of already-fetched operations.
 /// Used for both inline (join=operations) and separately-fetched operations.
+///
+/// The returned amount is the total native XLM moved by the transaction, in
+/// stroops: `payment` operations plus the sources handled by
+/// [`native_stroops_moved`]. `None` when no operation moved native XLM.
 fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Option<u64>) {
     let mut function_names: Vec<String> = Vec::new();
     let mut total_stroops: u64 = 0;
-    let mut has_payment = false;
+    let mut has_amount = false;
 
     for op in ops {
+        if let Some(stroops) = native_stroops_moved(&op) {
+            total_stroops = total_stroops.saturating_add(stroops);
+            has_amount = true;
+        }
         if op.op_type == "invoke_host_function" {
             if let Some(f) = op.function {
                 function_names.push(f);
@@ -1311,7 +1299,7 @@ fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Option<u
             if let Some(amt_str) = op.amount {
                 if let Ok(xlm) = amt_str.parse::<f64>() {
                     total_stroops = total_stroops.saturating_add((xlm * 10_000_000.0) as u64);
-                    has_payment = true;
+                    has_amount = true;
                 }
             }
         }
@@ -1319,11 +1307,7 @@ fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Option<u
 
     (
         function_names,
-        if has_payment {
-            Some(total_stroops)
-        } else {
-            None
-        },
+        if has_amount { Some(total_stroops) } else { None },
     )
 }
 
@@ -1885,6 +1869,7 @@ mod tests {
             http_tcp_keepalive_secs: 30,
             http_connection_verbose: None,
             max_contracts: None,
+            max_pages_per_cycle: None,
             cursor_file: None,
             contracts: vec![
                 WatchedContract {
@@ -2415,5 +2400,194 @@ mod tests {
             .await
             .unwrap();
         assert!(receiver.received_requests().await.unwrap().is_empty());
+    }
+}
+
+// ── Tests: native amounts and cursor migration ────────────────────────────────
+
+#[cfg(test)]
+mod amount_and_cursor_tests {
+    use super::*;
+
+    fn ops(json: serde_json::Value) -> Vec<HorizonOperation> {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn parse_stroops_is_exact() {
+        assert_eq!(parse_stroops("1"), Some(10_000_000));
+        assert_eq!(parse_stroops("1.5"), Some(15_000_000));
+        assert_eq!(parse_stroops("0.0000001"), Some(1));
+        assert_eq!(parse_stroops("1000.0000000"), Some(10_000_000_000));
+        assert_eq!(parse_stroops(".5"), Some(5_000_000));
+        // f64 would turn this into 9_999_999.999… and truncate to 9_999_999.
+        assert_eq!(parse_stroops("0.9999999"), Some(9_999_999));
+    }
+
+    #[test]
+    fn parse_stroops_rejects_bad_input() {
+        for bad in ["", ".", "-1", "1.00000001", "abc", "1.2.3", "1e3"] {
+            assert_eq!(parse_stroops(bad), None, "{bad:?}");
+        }
+        assert_eq!(parse_stroops("99999999999999999999"), None);
+    }
+
+    #[test]
+    fn payment_operations_still_count() {
+        let (_, amount) = extract_soroban_details(ops(serde_json::json!([
+            { "type": "payment", "amount": "1000.0000000" }
+        ])));
+        assert_eq!(amount, Some(10_000_000_000));
+    }
+
+    #[test]
+    fn create_account_counts_starting_balance() {
+        let (_, amount) = extract_soroban_details(ops(serde_json::json!([
+            { "type": "create_account", "starting_balance": "2.5000000" }
+        ])));
+        assert_eq!(amount, Some(25_000_000));
+    }
+
+    #[test]
+    fn path_payment_counts_the_native_leg() {
+        // Destination receives XLM: count `amount`.
+        let (_, to_native) = extract_soroban_details(ops(serde_json::json!([{
+            "type": "path_payment_strict_send",
+            "asset_type": "native", "amount": "10.0000000",
+            "source_asset_type": "credit_alphanum4", "source_amount": "99.0000000"
+        }])));
+        assert_eq!(to_native, Some(100_000_000));
+
+        // Source sends XLM: count `source_amount`.
+        let (_, from_native) = extract_soroban_details(ops(serde_json::json!([{
+            "type": "path_payment_strict_receive",
+            "asset_type": "credit_alphanum4", "amount": "99.0000000",
+            "source_asset_type": "native", "source_amount": "20.0000000"
+        }])));
+        assert_eq!(from_native, Some(200_000_000));
+
+        // Native on both sides counts once.
+        let (_, both) = extract_soroban_details(ops(serde_json::json!([{
+            "type": "path_payment_strict_send",
+            "asset_type": "native", "amount": "5.0000000",
+            "source_asset_type": "native", "source_amount": "5.1000000"
+        }])));
+        assert_eq!(both, Some(50_000_000));
+    }
+
+    #[test]
+    fn path_payment_between_non_native_assets_is_ignored() {
+        let (_, amount) = extract_soroban_details(ops(serde_json::json!([{
+            "type": "path_payment_strict_send",
+            "asset_type": "credit_alphanum4", "amount": "10.0000000",
+            "source_asset_type": "credit_alphanum4", "source_amount": "10.0000000"
+        }])));
+        assert_eq!(amount, None);
+    }
+
+    #[test]
+    fn soroban_native_transfers_are_counted_from_asset_balance_changes() {
+        let (functions, amount) = extract_soroban_details(ops(serde_json::json!([{
+            "type": "invoke_host_function",
+            "function": "HostFunctionTypeHostFunctionTypeInvokeContract",
+            "asset_balance_changes": [
+                { "type": "transfer", "asset_type": "native", "amount": "3.0000000" },
+                { "type": "transfer", "asset_type": "native", "amount": "1.5000000" },
+                { "type": "transfer", "asset_type": "credit_alphanum4", "amount": "500.0000000" },
+                { "type": "mint", "asset_type": "native", "amount": "7.0000000" }
+            ]
+        }])));
+        assert_eq!(functions.len(), 1);
+        assert_eq!(amount, Some(45_000_000));
+    }
+
+    #[test]
+    fn invoke_host_function_without_balance_changes_has_no_amount() {
+        let (_, amount) = extract_soroban_details(ops(serde_json::json!([
+            { "type": "invoke_host_function", "function": "withdraw" },
+            { "type": "invoke_host_function", "function": "x", "asset_balance_changes": null }
+        ])));
+        assert_eq!(amount, None);
+    }
+
+    #[test]
+    fn amounts_from_every_operation_type_are_summed() {
+        let (_, amount) = extract_soroban_details(ops(serde_json::json!([
+            { "type": "payment", "amount": "1.0000000" },
+            { "type": "create_account", "starting_balance": "2.0000000" },
+            { "type": "path_payment_strict_send", "asset_type": "native", "amount": "3.0000000" },
+            { "type": "invoke_host_function", "asset_balance_changes": [
+                { "type": "transfer", "asset_type": "native", "amount": "4.0000000" }
+            ] }
+        ])));
+        assert_eq!(amount, Some(100_000_000));
+    }
+
+    const ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+    fn saved(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn configured(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, id)| (k.to_string(), id.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn new_format_entries_are_kept_as_is() {
+        let key = format!("testnet:{ID}");
+        let migrated = migrate_saved_cursors(
+            saved(&[(key.as_str(), "42")]),
+            &configured(&[(key.as_str(), ID)]),
+        );
+        assert_eq!(migrated.get(&key).map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn legacy_entry_migrates_when_only_one_contract_has_that_id() {
+        let key = format!("testnet:{ID}");
+        let migrated = migrate_saved_cursors(saved(&[(ID, "42")]), &configured(&[(key.as_str(), ID)]));
+        assert_eq!(migrated.get(&key).map(String::as_str), Some("42"));
+        assert!(!migrated.contains_key(ID), "legacy key must be dropped");
+    }
+
+    #[test]
+    fn legacy_entry_is_not_guessed_when_the_id_is_on_several_networks() {
+        let testnet = format!("testnet:{ID}");
+        let mainnet = format!("mainnet:{ID}");
+        let migrated = migrate_saved_cursors(
+            saved(&[(ID, "42")]),
+            &configured(&[(testnet.as_str(), ID), (mainnet.as_str(), ID)]),
+        );
+        assert!(!migrated.contains_key(&testnet));
+        assert!(!migrated.contains_key(&mainnet));
+        assert!(!migrated.contains_key(ID));
+    }
+
+    #[test]
+    fn existing_new_format_entry_wins_over_a_legacy_one() {
+        let key = format!("testnet:{ID}");
+        let migrated = migrate_saved_cursors(
+            saved(&[(ID, "old"), (key.as_str(), "new")]),
+            &configured(&[(key.as_str(), ID)]),
+        );
+        assert_eq!(migrated.get(&key).map(String::as_str), Some("new"));
+    }
+
+    #[test]
+    fn new_format_entries_for_unconfigured_contracts_are_preserved() {
+        let other = "mainnet:CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let key = format!("testnet:{ID}");
+        let migrated = migrate_saved_cursors(
+            saved(&[(other, "9")]),
+            &configured(&[(key.as_str(), ID)]),
+        );
+        assert_eq!(migrated.get(other).map(String::as_str), Some("9"));
     }
 }

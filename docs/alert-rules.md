@@ -60,8 +60,18 @@ type = "TransactionFailed"
 Matches when the payment amount (extracted from Horizon operations) is ≥ `threshold_xlm` XLM.
 The `amount_xlm` field in the webhook payload contains the actual transferred amount.
 
-**Note:** Amount is extracted from `payment` operation records. Soroban token transfers
-that do not produce a native `payment` operation will not populate `amount_xlm`.
+**Note:** The amount is the total native XLM moved by the transaction, summed across:
+
+- `payment` operations;
+- `create_account` operations (`starting_balance`);
+- `path_payment_strict_send` / `path_payment_strict_receive` operations, for the native leg
+  (`amount` when the destination asset is XLM, otherwise `source_amount` when the source asset
+  is XLM);
+- native `transfer` entries in `asset_balance_changes` on `invoke_host_function` operations
+  (Stellar Asset Contract transfers of XLM).
+
+Transfers of non-native assets are not counted, and a transaction that moves no native XLM does
+not populate `amount_xlm`.
 
 ```toml
 [[contracts.rules]]
