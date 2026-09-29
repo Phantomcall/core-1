@@ -28,6 +28,8 @@ pub mod event_stream;
 pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent, SorobanEventStreamer};
 pub mod plan_cache;
 pub use plan_cache::{PlanCache, PlanStatistics};
+mod poll_health;
+use poll_health::{jitter_percent_from_env, poll_ticker, start_offset, PollHealth};
 
 // ── Optional Prometheus metrics ───────────────────────────────────────────────
 
@@ -341,6 +343,18 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Logs a failed poll with enough context to tell contracts apart.
+fn log_poll_failure(contract: &WatchedContract, consecutive_failures: u32, error: &anyhow::Error) {
+    error!(
+        contract = %contract.label,
+        network = %contract.network.as_str(),
+        contract_id = %contract.contract_id,
+        consecutive_failures,
+        error = %error,
+        "contract polling task failed"
+    );
+}
+
 /// Polls one contract every `interval` until `stop` reports `true`, finishing
 /// the in-flight poll first. Returns the contract ID and its latest cursor.
 async fn poll_contract_forever(
@@ -357,7 +371,15 @@ async fn poll_contract_forever(
     // A single tracker for this contract's lifetime, so cooldowns survive
     // across poll cycles rather than deduping only within one.
     let mut cooldowns = CooldownTracker::new();
+    let mut health = PollHealth::default();
+    // Polls are paced by a fixed-period ticker, so the period stays at
+    // `interval` however long a cycle takes. The first poll happens
+    // immediately; the per-contract offset staggers every poll after it so
+    // contracts do not all hit Horizon at the same instant.
+    let offset = start_offset(&contract.contract_id, interval, jitter_percent_from_env());
+    let mut ticker = poll_ticker(interval, offset);
     loop {
+        let cycle_started = std::time::Instant::now();
         match poll_contract(
             &client,
             &contract,
@@ -369,6 +391,15 @@ async fn poll_contract_forever(
         .await
         {
             Ok((txs, alerts, _webhook_failures)) => {
+                if let Some(failures) = health.record_success() {
+                    info!(
+                        contract = %contract.label,
+                        network = %contract.network.as_str(),
+                        contract_id = %contract.contract_id,
+                        previous_consecutive_failures = failures,
+                        "contract recovered"
+                    );
+                }
                 counters.transactions.fetch_add(txs, Ordering::Relaxed);
                 counters.alerts.fetch_add(alerts, Ordering::Relaxed);
                 counters
@@ -388,17 +419,41 @@ async fn poll_contract_forever(
                 }
             }
             Err(e) => {
-                error!(contract = %contract.label, error = %e, "contract polling task failed");
+                let became_unhealthy = health.record_failure();
+                log_poll_failure(&contract, health.consecutive_failures(), &e);
+                if became_unhealthy {
+                    warn!(
+                        contract = %contract.label,
+                        network = %contract.network.as_str(),
+                        contract_id = %contract.contract_id,
+                        consecutive_failures = health.consecutive_failures(),
+                        seconds_since_last_success = ?health.since_last_success().map(|d| d.as_secs()),
+                        "contract unhealthy: polling keeps failing, backing off"
+                    );
+                }
                 #[cfg(feature = "metrics")]
                 metrics::record_poll_failure(&contract.label, contract.network.as_str());
+                // Back off (capped) while the contract keeps failing.
+                ticker.reset_after(health.backoff_delay(interval));
             }
+        }
+        let cycle = cycle_started.elapsed();
+        if cycle > interval {
+            warn!(
+                contract = %contract.label,
+                network = %contract.network.as_str(),
+                contract_id = %contract.contract_id,
+                cycle_ms = cycle.as_millis() as u64,
+                interval_ms = interval.as_millis() as u64,
+                "poll cycle took longer than the configured interval"
+            );
         }
         if *stop.borrow() {
             break;
         }
 
         tokio::select! {
-            () = tokio::time::sleep(interval) => {}
+            _ = ticker.tick() => {}
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
                     break;
@@ -516,7 +571,7 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
                 report.webhook_failures += webhook_failures;
             }
             Err(e) => {
-                error!(contract = %contract.label, error = %e, "contract polling task failed");
+                log_poll_failure(contract, 1, &e);
                 report.poll_failures += 1;
             }
         }
@@ -2135,5 +2190,63 @@ mod tests {
         .await
         .unwrap();
         assert!(receiver.received_requests().await.unwrap().is_empty());
+    }
+
+    /// Issue #21: the failure log must identify which contract failed.
+    #[test]
+    fn poll_failure_log_carries_contract_context() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let contract = WatchedContract {
+            label: "Vault".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
+            network: Network::Testnet,
+            rules: vec![rule(AlertRule::AnyTransaction)],
+            webhook_url: Some("https://hooks.example.com/test".into()),
+            webhook_secret: None,
+            poll_interval_seconds: None,
+            enabled: true,
+            soroban_rpc_url: None,
+            horizon_base_url_override: None,
+            webhook_format: Default::default(),
+            webhook_headers: Default::default(),
+            webhook_routing_key: None,
+            webhooks: Vec::new(),
+            batch_alerts: false,
+        };
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_poll_failure(&contract, 3, &anyhow::anyhow!("horizon unreachable"));
+        });
+
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("contract polling task failed"), "{output}");
+        assert!(output.contains("contract=Vault"), "{output}");
+        assert!(output.contains("network=testnet"), "{output}");
+        assert!(output.contains(&format!("contract_id={}", contract.contract_id)), "{output}");
+        assert!(output.contains("consecutive_failures=3"), "{output}");
     }
 }
