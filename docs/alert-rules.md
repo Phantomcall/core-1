@@ -73,6 +73,14 @@ The `amount_xlm` field in the webhook payload contains the actual transferred am
 Transfers of non-native assets are not counted, and a transaction that moves no native XLM does
 not populate `amount_xlm`.
 
+**Native-only:** Only payments whose `asset_type` is `native` (XLM) are counted. Payments in
+issued assets (`credit_alphanum4` / `credit_alphanum12`, e.g. USDC) are ignored, so a large
+non-native payment never fires `LargeTransfer` and never sets `amount_xlm`.
+
+**Precision:** Amounts are parsed as fixed-point stroops (up to 7 fractional digits), not as
+floating point. A native payment with a malformed amount is logged as an error and its
+operation details are not used for rule evaluation.
+
 ```toml
 [[contracts.rules]]
 type          = "LargeTransfer"
