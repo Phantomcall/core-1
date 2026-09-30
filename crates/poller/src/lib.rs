@@ -790,6 +790,12 @@ async fn poll_contract(
     let mut page_cursor = cursor.clone();
 
     loop {
+        // Issue #23: use join=operations to fetch operations inline, eliminating
+        // one HTTP request per transaction.
+        // Issue #2: `include_failed=true` is required or Horizon only returns
+        // successful transactions, which makes `TransactionFailed` dead.
+        let url = format!(
+            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations&include_failed=true",
         // Checked against horizon-testnet.stellar.org: `join=operations` on the
         // transactions endpoint is NOT supported. Horizon answers 200 but ignores
         // it and returns no `operations` array (only `join=transactions` exists,

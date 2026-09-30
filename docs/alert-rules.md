@@ -46,6 +46,10 @@ Matches transactions where `successful = false`.
 
 **Use case:** detect reverted Soroban invocations or fee-bump failures.
 
+The poller requests transactions with `include_failed=true`, so failed
+transactions are fetched. Horizon omits them by default, which would leave this
+rule unable to match anything.
+
 ```toml
 [[contracts.rules]]
 type = "TransactionFailed"
