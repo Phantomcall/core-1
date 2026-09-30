@@ -73,6 +73,7 @@ async fn run_polls_once_and_fires_webhook() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -144,6 +145,7 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -189,6 +191,7 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -704,6 +707,7 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -769,6 +773,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -846,6 +851,7 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -943,6 +949,7 @@ async fn contracts_polled_concurrently() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
         cursor_file: None,
     };
 
@@ -1016,6 +1023,7 @@ async fn reload_keeps_existing_cursors_and_starts_new_contracts() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1106,6 +1114,7 @@ async fn per_contract_poll_interval_is_scheduled_independently() {
         http_tcp_keepalive_secs: 30,
         http_connection_verbose: None,
         max_contracts: None,
+        max_pages_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(2500), txwatch_poller::run(cfg)).await;

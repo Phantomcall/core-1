@@ -25,11 +25,12 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 | Field                         | Type            | Required | Default | Description |
 |-------------------------------|-----------------|----------|---------|-------------|
 | `poll_interval_seconds`       | u64             | no       | `10`    | How often to poll Horizon (seconds). Must be ≥ 5 and ≤ 3600. Each contract can override it (see below). |
-| `contracts`                   | array of tables | yes      | —       | The `[[contracts]]` entries (see below). At least one is required; labels must be unique (case-insensitive). |
-| `cursor_file`                 | string (path)   | no       | unset   | JSON file used to persist the per-contract cursor map. Loaded on startup and rewritten after each poll cycle. When unset, cursors start at Horizon's `now` and are not persisted. A missing or unparsable file falls back to `now`. |
+| `contracts`                   | array of tables | yes      | —       | The `[[contracts]]` entries (see below). At least one is required; labels must be unique (case-insensitive), and each `(network, contract_id)` pair may appear only once. |
+| `cursor_file`                 | string (path)   | no       | unset   | JSON file used to persist the per-contract cursor map. Loaded on startup and rewritten after each poll cycle. When unset, cursors start at Horizon's `now` and are not persisted. A missing or unparsable file falls back to `now`. Cursors are keyed `<network>:<contract_id>`; a file written by an older version (keyed by bare contract ID) is migrated automatically, except for a contract ID watched on several networks, which starts from `now`. |
 | `http_pool_max_idle_per_host` | usize           | no       | `10`    | Maximum idle connections kept per host in the HTTP pool. Must be 1–100. Lower values use less memory; higher values help with many contracts. |
 | `http_tcp_keepalive_secs`     | u64             | no       | `30`    | TCP keepalive interval (seconds) for pooled HTTP connections. Must be ≤ 7200; `0` disables keepalive. |
 | `http_connection_verbose`     | bool            | no       | `false` | Reserved for HTTP connection-pool debug output. Accepted by the parser but currently has no effect. |
+| `max_pages_per_cycle`         | usize           | no       | `10`    | Maximum Horizon pages (200 transactions each) fetched per contract in one poll cycle. Must be 1–1000. Pages are processed as they arrive; when the cap is hit a warning is logged and the next cycle continues from the saved cursor. |
 | `max_contracts`               | usize           | no       | `100`   | Maximum number of `[[contracts]]` entries. Must be 1–10000. Raise it only when your Horizon instance (typically your own) can take the extra polling load. |
 
 Unknown top-level keys are rejected.
