@@ -41,6 +41,14 @@ Unknown top-level keys are rejected.
 > `poll_interval_seconds = 10`; for high-volume deployments with many contracts, `poll_interval_seconds = 30` or
 > higher is advised. TxWatch logs a startup warning when more than 5 contracts are polled at an effective
 > interval below 10 seconds.
+>
+> **Poll staggering:** each contract polls on its own fixed-period schedule. The first poll of a contract happens
+> immediately at startup; every later poll is shifted by a deterministic per-contract offset of up to 10% of the
+> contract's poll interval, so contracts do not all hit Horizon at the same instant every cycle. Set the
+> `TXWATCH_POLL_JITTER_PERCENT` environment variable to change the percentage (clamped to 100); `0` disables the
+> offset. A contract that keeps failing is polled less often (the delay doubles per consecutive failure, capped at
+> 10 minutes), is reported once as unhealthy after 5 consecutive failures, and is reported once as recovered on its
+> next success. `txwatch_consecutive_poll_failures` exposes the failure streak.
 
 > **Contract limit:** a configuration may hold at most `max_contracts` (default `100`, `MAX_CONTRACTS` in `txwatch-config`) `[[contracts]]` entries; more is rejected at startup. Every contract is polled by its own task, so very large lists can exhaust memory, file descriptors or the public Horizon rate limit. Split large deployments across several TxWatch instances, or raise `max_contracts` (up to 10000) when polling your own Horizon.
 
